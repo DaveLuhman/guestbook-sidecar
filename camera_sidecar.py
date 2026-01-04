@@ -17,13 +17,15 @@ import time
 import threading
 import gc
 import sys
+import os
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request, Response
-from threading import Thread, Lock
+from threading import Thread, Lock, Condition
 from picamera2 import Picamera2
 import cv2
 import numpy as np
 from pyzbar.pyzbar import decode as decode_barcodes, ZBarSymbol
+import psutil
 
 app = Flask(__name__)
 
@@ -44,13 +46,15 @@ CAPTURE_FPS = 14  # Target capture rate (~14 FPS)
 CAPTURE_INTERVAL = 1.0 / CAPTURE_FPS  # ~0.07 seconds between captures
 DECODE_INTERVAL = 0.02  # Reduced delay to process frames faster (~50 FPS decode rate)
 DECODE_SKIP_FRAMES = 2  # Only decode every Nth frame to keep up with capture rate
-GC_COLLECT_INTERVAL = 1000  # Force garbage collection every N decode iterations (~20 seconds)
+GC_COLLECT_INTERVAL = 2000  # Force garbage collection every N decode iterations (~40 seconds, reduced frequency)
 MEMORY_MONITOR_INTERVAL = 500  # Log memory usage every N decode iterations (~10 seconds)
 
 # Shared state
 picam2 = None
 latest_frame = None
 frame_lock = Lock()
+frame_condition = Condition(frame_lock)  # Condition for frame notification
+frame_sequence = 0  # Sequence counter for new frames
 latest_scan_id = 0
 latest_scan = None
 scan_lock = Lock()
@@ -71,10 +75,12 @@ def camera_capture_loop():
         pic = Picamera2()
         picam2 = pic
 
-        # Use higher resolution for better barcode detection
-        # 1280x720 gives better detail for small barcodes
+        # Use multi-stream configuration:
+        # - Main stream: high-res RGB for barcode detection
+        # - LoRes stream: lower-res for MJPEG preview (reduces CPU load)
         config = pic.create_video_configuration(
-            main={"size": (1280, 720), "format": "RGB888"}
+            main={"size": (1280, 720), "format": "RGB888"},
+            lores={"size": (640, 360), "format": "YUV420"}  # Lower res for preview
         )
         pic.configure(config)
 
@@ -127,12 +133,15 @@ def camera_capture_loop():
             try:
                 frame = pic.capture_array()
                 frame_count += 1
-                with frame_lock:
+                with frame_condition:
                     # Replace old frame reference (let GC clean it up)
                     old_frame = latest_frame
                     latest_frame = frame
+                    frame_sequence += 1
                     # Explicitly delete old frame reference to help GC
                     del old_frame
+                    # Notify waiting decode thread of new frame
+                    frame_condition.notify_all()
 
                 # Periodically trigger autofocus to keep it adjusting
                 if autofocus_enabled and frame_count % autofocus_trigger_interval == 0:
@@ -186,42 +195,65 @@ def barcode_decode_loop():
 
     decode_count = 0
     frame_skip_counter = 0
+    last_frame_sequence = 0
+
     while running:
         try:
             frame = None
-            with frame_lock:
+            current_sequence = 0
+
+            # Wait for new frame using condition variable instead of polling
+            with frame_condition:
+                # Wait for a new frame (with timeout to allow shutdown)
+                frame_condition.wait(timeout=0.1)
+
                 if latest_frame is not None:
-                    frame = latest_frame.copy()
+                    current_sequence = frame_sequence
+                    # Skip frames to keep up with capture rate
+                    if current_sequence != last_frame_sequence:
+                        frame_skip_counter += 1
+                        if frame_skip_counter >= DECODE_SKIP_FRAMES:
+                            frame_skip_counter = 0
+                            last_frame_sequence = current_sequence
+                            # Assign frame reference directly (no copy!)
+                            frame = latest_frame
+                        else:
+                            last_frame_sequence = current_sequence
 
             if frame is not None:
-                # Skip frames to keep up with capture rate
-                frame_skip_counter += 1
-                if frame_skip_counter < DECODE_SKIP_FRAMES:
-                    time.sleep(DECODE_INTERVAL)
-                    continue
-                frame_skip_counter = 0
-
                 decode_count += 1
-                # Picamera2 gives RGB, OpenCV/pyzbar likes BGR
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-                # Preprocess image for better barcode detection
-                # Convert to grayscale (pyzbar works better on grayscale)
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                # Convert RGB → GRAY directly (eliminates RGB → BGR → GRAY double conversion)
+                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
 
-                # Try preprocessing approaches in order of speed/effectiveness
-                # Start with fastest methods first, only try slower ones if needed
-                processed_images = [
-                    ("grayscale", gray),  # Fastest and most effective
-                    ("grayscale_threshold", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),  # Good for blurry images
-                    ("grayscale_contrast", cv2.convertScaleAbs(gray, alpha=1.5, beta=30)),  # Increase contrast
-                ]
-
+                # Lazy preprocessing: try grayscale first, only compute expensive transforms on failure
                 barcodes = []
-                for method_name, processed_img in processed_images:
+
+                # Try grayscale first (fastest)
+                try:
+                    detected = decode_barcodes(gray, symbols=[
+                        ZBarSymbol.CODE128,
+                        ZBarSymbol.CODE39,
+                        ZBarSymbol.EAN13,
+                        ZBarSymbol.EAN8,
+                        ZBarSymbol.UPCA,
+                        ZBarSymbol.UPCE,
+                        ZBarSymbol.I25,
+                        ZBarSymbol.CODABAR,
+                    ])
+                    if detected:
+                        barcodes.extend(detected)
+                        if decode_count % 50 == 0:
+                            print(f"[DECODE] Found {len(detected)} barcode(s) using grayscale")
+                except Exception as e:
+                    if decode_count % 50 == 0:
+                        print(f"[DECODE] Error with grayscale: {e}")
+
+                # Only try threshold if grayscale failed (or every N frames for robustness)
+                if not barcodes and decode_count % 3 == 0:
                     try:
-                        # Try decoding with all barcode types enabled
-                        detected = decode_barcodes(processed_img, symbols=[
+                        thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+                        detected = decode_barcodes(thresholded, symbols=[
                             ZBarSymbol.CODE128,
                             ZBarSymbol.CODE39,
                             ZBarSymbol.EAN13,
@@ -234,13 +266,32 @@ def barcode_decode_loop():
                         if detected:
                             barcodes.extend(detected)
                             if decode_count % 50 == 0:
-                                print(f"[DECODE] Found {len(detected)} barcode(s) using {method_name}")
-                            # If we found barcodes, we can stop trying other methods
-                            break
+                                print(f"[DECODE] Found {len(detected)} barcode(s) using threshold")
                     except Exception as e:
                         if decode_count % 50 == 0:
-                            print(f"[DECODE] Error with {method_name}: {e}")
-                        continue
+                            print(f"[DECODE] Error with threshold: {e}")
+
+                # Only try contrast enhancement as last resort
+                if not barcodes and decode_count % 5 == 0:
+                    try:
+                        contrast = cv2.convertScaleAbs(gray, alpha=1.5, beta=30)
+                        detected = decode_barcodes(contrast, symbols=[
+                            ZBarSymbol.CODE128,
+                            ZBarSymbol.CODE39,
+                            ZBarSymbol.EAN13,
+                            ZBarSymbol.EAN8,
+                            ZBarSymbol.UPCA,
+                            ZBarSymbol.UPCE,
+                            ZBarSymbol.I25,
+                            ZBarSymbol.CODABAR,
+                        ])
+                        if detected:
+                            barcodes.extend(detected)
+                            if decode_count % 50 == 0:
+                                print(f"[DECODE] Found {len(detected)} barcode(s) using contrast")
+                    except Exception as e:
+                        if decode_count % 50 == 0:
+                            print(f"[DECODE] Error with contrast: {e}")
 
                 # Remove duplicates (same code detected multiple times)
                 seen_codes = set()
@@ -261,20 +312,15 @@ def barcode_decode_loop():
 
                 # Memory monitoring and garbage collection
                 if decode_count % MEMORY_MONITOR_INTERVAL == 0:
-                    import psutil
-                    import os
                     try:
                         process = psutil.Process(os.getpid())
                         mem_info = process.memory_info()
                         mem_mb = mem_info.rss / 1024 / 1024
                         print(f"[MEMORY] RSS: {mem_mb:.1f} MB")
-                    except ImportError:
-                        # psutil not available, skip monitoring
-                        pass
                     except Exception as e:
                         print(f"[MEMORY] Error monitoring memory: {e}")
 
-                # Periodic garbage collection to free up numpy arrays
+                # Periodic garbage collection to free up numpy arrays (reduced frequency)
                 if decode_count % GC_COLLECT_INTERVAL == 0:
                     collected = gc.collect()
                     if collected > 0:
@@ -316,7 +362,7 @@ def barcode_decode_loop():
                     last_time = now
                     break  # Only handle one per frame
 
-            time.sleep(DECODE_INTERVAL)  # Small delay to avoid pegging CPU
+            # No sleep needed - condition variable handles waiting efficiently
 
         except Exception as e:
             print(f"Error in barcode decode loop: {e}")
@@ -403,38 +449,71 @@ def debug_frame():
 def video_stream():
     """
     MJPEG video stream endpoint for displaying camera feed.
+    Uses separate lores stream to avoid impacting detection performance.
     Only intended for debug/dev use - not for production.
     """
     def generate():
         """Generator function to stream MJPEG frames"""
+        last_frame_time = 0.0
+        preview_fps = 6.0  # Target ~6 FPS for preview (reduces CPU load)
+        preview_interval = 1.0 / preview_fps  # ~0.167 seconds
+
         while running:
             try:
-                with frame_lock:
-                    if latest_frame is None:
-                        time.sleep(0.1)
-                        continue
-                    # Copy frame to avoid holding lock too long
-                    frame = latest_frame.copy()
+                current_time = time.time()
 
-                # Convert RGB to BGR for OpenCV encoding
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # Throttle preview to target FPS
+                if current_time - last_frame_time < preview_interval:
+                    time.sleep(0.01)  # Small sleep to avoid busy-waiting
+                    continue
 
-                # Resize for lower bandwidth (optional - adjust as needed)
-                # Keep original size for better quality in debug
-                # bgr = cv2.resize(bgr, (640, 360))
+                # Use lores stream if available (separate from detection stream)
+                preview_frame = None
+                if picam2 is not None:
+                    try:
+                        # Capture from lores stream (lower resolution, less CPU)
+                        preview_frame = picam2.capture_array("lores")
+                        # Handle YUV420 format from lores stream
+                        if preview_frame.ndim == 2:  # Y plane only (grayscale)
+                            preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_GRAY2BGR)
+                        elif preview_frame.ndim == 3 and preview_frame.shape[2] == 3:
+                            # Already RGB/BGR format
+                            preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_RGB2BGR)
+                        else:
+                            # Try YUV420 conversion (Picamera2 may return planar YUV)
+                            try:
+                                preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_YUV420p2BGR)
+                            except:
+                                # If conversion fails, treat as grayscale
+                                if preview_frame.ndim == 2:
+                                    preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_GRAY2BGR)
+                    except Exception as e:
+                        # Fallback to main stream if lores not available
+                        print(f"[VIDEO] Could not use lores stream, falling back: {e}")
+                        with frame_lock:
+                            if latest_frame is not None:
+                                preview_frame = latest_frame.copy()
+                                # Convert RGB to BGR for OpenCV encoding
+                                preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_RGB2BGR)
 
-                # Encode as JPEG
-                ret, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if preview_frame is None:
+                    time.sleep(0.1)
+                    continue
+
+                # Downscale for lower bandwidth and CPU usage
+                preview_frame = cv2.resize(preview_frame, (640, 360))
+
+                # Encode as JPEG with lower quality for faster encoding
+                ret, jpeg = cv2.imencode('.jpg', preview_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 if not ret:
-                    time.sleep(0.033)  # ~30 FPS
+                    time.sleep(preview_interval)
                     continue
 
                 # Yield MJPEG frame
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
 
-                # Small delay to control frame rate (~15 FPS for video stream)
-                time.sleep(0.067)
+                last_frame_time = current_time
             except Exception as e:
                 print(f"[VIDEO] Error in video stream: {e}")
                 time.sleep(0.1)
@@ -485,8 +564,6 @@ def trigger_autofocus():
 def debug_memory():
     """Debug endpoint to check memory usage"""
     try:
-        import psutil
-        import os
         process = psutil.Process(os.getpid())
         mem_info = process.memory_info()
 
