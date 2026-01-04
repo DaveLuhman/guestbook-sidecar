@@ -171,7 +171,7 @@ def camera_capture_loop():
 
                 # Log every 50 frames (~3.5 seconds at 14fps)
                 if frame_count % 50 == 0:
-                    print(f"[CAPTURE] Captured {frame_count} frames, latest frame shape: {frame.shape}")
+                    print(f"[CAPTURE] Captured {frame_count} frames, latest frame shape: {main_frame.shape}")
 
             except Exception as e:
                 print(f"Error capturing frame: {e}")
@@ -436,6 +436,7 @@ def video_stream():
     """
     def generate():
         """Generator function to stream MJPEG frames"""
+        last_seen_seq = 0
         last_seen_seq = 0
         while running:
             try:
