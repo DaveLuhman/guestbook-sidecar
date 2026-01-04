@@ -55,6 +55,14 @@ PREVIEW_HEIGHT = 360
 PREVIEW_FPS = 15
 PREVIEW_JPEG_QUALITY = 85
 
+# Camera resolution constants
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+PREVIEW_WIDTH = 640
+PREVIEW_HEIGHT = 360
+PREVIEW_FPS = 15
+PREVIEW_JPEG_QUALITY = 85
+
 # Shared state
 picam2 = None
 latest_frame = None
@@ -62,8 +70,16 @@ latest_frame_seq = 0
 latest_lores_frame = None
 latest_lores_seq = 0
 frame_condition = threading.Condition()
+latest_frame_seq = 0
+latest_lores_frame = None
+latest_lores_seq = 0
+frame_condition = threading.Condition()
 latest_scan_id = 0
 latest_scan = None
+latest_scan_ts = None
+latest_scan_seq = 0
+scan_condition = threading.Condition()
+scan_lock = Lock()  # Keep for backward compatibility with error handling
 latest_scan_ts = None
 latest_scan_seq = 0
 scan_condition = threading.Condition()
@@ -88,7 +104,12 @@ def camera_capture_loop():
         # Use multi-stream configuration:
         # - main: RGB888 at 1280x720 for barcode detection
         # - lores: RGB888 at 640x360 for preview (no YUV color shift)
+        # Use multi-stream configuration:
+        # - main: RGB888 at 1280x720 for barcode detection
+        # - lores: RGB888 at 640x360 for preview (no YUV color shift)
         config = pic.create_video_configuration(
+            main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"},
+            lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"}
             main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"},
             lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"}
         )
@@ -126,9 +147,11 @@ def camera_capture_loop():
                 print(f"[CAPTURE] Warning: Could not trigger initial autofocus: {e}")
 
         print(f"Camera opened successfully (main: {CAMERA_WIDTH}x{CAMERA_HEIGHT} RGB, lores: {PREVIEW_WIDTH}x{PREVIEW_HEIGHT} RGB)")
+        print(f"Camera opened successfully (main: {CAMERA_WIDTH}x{CAMERA_HEIGHT} RGB, lores: {PREVIEW_WIDTH}x{PREVIEW_HEIGHT} RGB)")
 
         # Capture a test frame to verify camera is working
         try:
+            test_frame = pic.capture_array("main")
             test_frame = pic.capture_array("main")
             print(f"[CAPTURE] Test frame captured: shape={test_frame.shape}, dtype={test_frame.dtype}")
             # Save test frame for debugging
@@ -144,7 +167,12 @@ def camera_capture_loop():
                 # Capture both main and lores streams
                 main_frame = pic.capture_array("main")
                 lores_frame = pic.capture_array("lores")
+                # Capture both main and lores streams
+                main_frame = pic.capture_array("main")
+                lores_frame = pic.capture_array("lores")
                 frame_count += 1
+                with frame_condition:
+                    # Replace old frame references (let GC clean them up)
                 with frame_condition:
                     # Replace old frame references (let GC clean them up)
                     old_frame = latest_frame
@@ -154,7 +182,15 @@ def camera_capture_loop():
                     latest_lores_frame = lores_frame
                     latest_lores_seq += 1
                     # Explicitly delete old frame references to help GC
+                    old_lores_frame = latest_lores_frame
+                    latest_frame = main_frame
+                    latest_frame_seq += 1
+                    latest_lores_frame = lores_frame
+                    latest_lores_seq += 1
+                    # Explicitly delete old frame references to help GC
                     del old_frame
+                    del old_lores_frame
+                    frame_condition.notify_all()
                     del old_lores_frame
                     frame_condition.notify_all()
 
@@ -213,6 +249,7 @@ def barcode_decode_loop():
     while running:
         try:
             frame = None
+            with frame_condition:
             with frame_condition:
                 if latest_frame is not None:
                     frame = latest_frame.copy()
@@ -326,6 +363,7 @@ def barcode_decode_loop():
 
                     # New scan detected
                     with scan_condition:
+                    with scan_condition:
                         latest_scan_id += 1
                         latest_scan = {
                             "id": latest_scan_id,
@@ -334,7 +372,10 @@ def barcode_decode_loop():
                         }
                         latest_scan_seq = latest_scan_id  # Use same ID for seq
                         latest_scan_ts = time.time()
+                        latest_scan_seq = latest_scan_id  # Use same ID for seq
+                        latest_scan_ts = time.time()
                         camera_error = None  # Clear any previous error
+                        scan_condition.notify_all()
                         scan_condition.notify_all()
 
                     print(f"[DECODE] Scan #{latest_scan_id}: {code}")
@@ -356,6 +397,7 @@ def barcode_decode_loop():
 def debug_frame():
     """Debug endpoint to capture and save current frame"""
     try:
+        with frame_condition:
         with frame_condition:
             if latest_frame is None:
                 return jsonify({"error": "No frame available"}), 404
@@ -437,6 +479,7 @@ def video_stream():
     def generate():
         """Generator function to stream MJPEG frames"""
         last_seen_seq = 0
+        last_seen_seq = 0
         while running:
             try:
                 # Wait for new lores frame
@@ -452,11 +495,15 @@ def video_stream():
                     continue
 
                 # Convert RGB to BGR for OpenCV encoding (lores is already RGB888)
+                # Convert RGB to BGR for OpenCV encoding (lores is already RGB888)
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
                 # Encode as JPEG with preview quality
                 ret, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
+                # Encode as JPEG with preview quality
+                ret, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
                 if not ret:
+                    time.sleep(1.0 / PREVIEW_FPS)
                     time.sleep(1.0 / PREVIEW_FPS)
                     continue
 
@@ -464,6 +511,8 @@ def video_stream():
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
 
+                # Throttle to PREVIEW_FPS
+                time.sleep(1.0 / PREVIEW_FPS)
                 # Throttle to PREVIEW_FPS
                 time.sleep(1.0 / PREVIEW_FPS)
             except Exception as e:
@@ -556,12 +605,25 @@ def next_scan():
                                Only return scans with seq > since. Default: 0
         timeout (float, optional): Maximum time to wait for a new scan in seconds.
                                    Default: 15
+        since (int, optional): The last scan sequence number the client has seen.
+                               Only return scans with seq > since. Default: 0
+        timeout (float, optional): Maximum time to wait for a new scan in seconds.
+                                   Default: 15
 
     Returns immediately if a new scan is available, otherwise waits up to
     timeout seconds for a new scan using efficient Condition.wait().
+    timeout seconds for a new scan using efficient Condition.wait().
 
     Response format:
+    Response format:
         {
+            "ok": true,
+            "scan": {
+                "id": 123,
+                "code": "1234567890",
+                "timestamp": "2025-01-01T00:00:00Z"
+            } or null,
+            "seq": 123
             "ok": true,
             "scan": {
                 "id": 123,
@@ -594,12 +656,14 @@ def next_scan():
                 timeout = float(request.args.get('timeout', 15.0))
             except ValueError:
                 timeout = 15.0
+                timeout = 15.0
 
         # Log which API format was used
         using_old_api = 'since_id' in request.args
         api_format = 'since_id' if using_old_api else 'since'
         print(f"[HTTP] GET /next_scan?{api_format}={since}&timeout={timeout}")
 
+        # Check for errors first
         # Check for errors first
         with scan_lock:
             if camera_error:
