@@ -47,13 +47,27 @@ DECODE_SKIP_FRAMES = 2  # Only decode every Nth frame to keep up with capture ra
 GC_COLLECT_INTERVAL = 1000  # Force garbage collection every N decode iterations (~20 seconds)
 MEMORY_MONITOR_INTERVAL = 500  # Log memory usage every N decode iterations (~10 seconds)
 
+# Camera resolution constants
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+PREVIEW_WIDTH = 640
+PREVIEW_HEIGHT = 360
+PREVIEW_FPS = 15
+PREVIEW_JPEG_QUALITY = 85
+
 # Shared state
 picam2 = None
 latest_frame = None
-frame_lock = Lock()
+latest_frame_seq = 0
+latest_lores_frame = None
+latest_lores_seq = 0
+frame_condition = threading.Condition()
 latest_scan_id = 0
 latest_scan = None
-scan_lock = Lock()
+latest_scan_ts = None
+latest_scan_seq = 0
+scan_condition = threading.Condition()
+scan_lock = Lock()  # Keep for backward compatibility with error handling
 camera_error = None
 running = True
 
@@ -71,10 +85,12 @@ def camera_capture_loop():
         pic = Picamera2()
         picam2 = pic
 
-        # Use higher resolution for better barcode detection
-        # 1280x720 gives better detail for small barcodes
+        # Use multi-stream configuration:
+        # - main: RGB888 at 1280x720 for barcode detection
+        # - lores: RGB888 at 640x360 for preview (no YUV color shift)
         config = pic.create_video_configuration(
-            main={"size": (1280, 720), "format": "RGB888"}
+            main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"},
+            lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"}
         )
         pic.configure(config)
 
@@ -109,11 +125,11 @@ def camera_capture_loop():
             except Exception as e:
                 print(f"[CAPTURE] Warning: Could not trigger initial autofocus: {e}")
 
-        print("Camera opened successfully (1280x720 RGB)")
+        print(f"Camera opened successfully (main: {CAMERA_WIDTH}x{CAMERA_HEIGHT} RGB, lores: {PREVIEW_WIDTH}x{PREVIEW_HEIGHT} RGB)")
 
         # Capture a test frame to verify camera is working
         try:
-            test_frame = pic.capture_array()
+            test_frame = pic.capture_array("main")
             print(f"[CAPTURE] Test frame captured: shape={test_frame.shape}, dtype={test_frame.dtype}")
             # Save test frame for debugging
             cv2.imwrite('/tmp/camera_test_frame.jpg', cv2.cvtColor(test_frame, cv2.COLOR_RGB2BGR))
@@ -125,14 +141,22 @@ def camera_capture_loop():
         autofocus_trigger_interval = 150  # Trigger autofocus every ~10 seconds (150 frames at 14fps)
         while running:
             try:
-                frame = pic.capture_array()
+                # Capture both main and lores streams
+                main_frame = pic.capture_array("main")
+                lores_frame = pic.capture_array("lores")
                 frame_count += 1
-                with frame_lock:
-                    # Replace old frame reference (let GC clean it up)
+                with frame_condition:
+                    # Replace old frame references (let GC clean them up)
                     old_frame = latest_frame
-                    latest_frame = frame
-                    # Explicitly delete old frame reference to help GC
+                    old_lores_frame = latest_lores_frame
+                    latest_frame = main_frame
+                    latest_frame_seq += 1
+                    latest_lores_frame = lores_frame
+                    latest_lores_seq += 1
+                    # Explicitly delete old frame references to help GC
                     del old_frame
+                    del old_lores_frame
+                    frame_condition.notify_all()
 
                 # Periodically trigger autofocus to keep it adjusting
                 if autofocus_enabled and frame_count % autofocus_trigger_interval == 0:
@@ -189,7 +213,7 @@ def barcode_decode_loop():
     while running:
         try:
             frame = None
-            with frame_lock:
+            with frame_condition:
                 if latest_frame is not None:
                     frame = latest_frame.copy()
 
@@ -301,14 +325,17 @@ def barcode_decode_loop():
                         continue
 
                     # New scan detected
-                    with scan_lock:
+                    with scan_condition:
                         latest_scan_id += 1
                         latest_scan = {
                             "id": latest_scan_id,
                             "code": code,
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         }
+                        latest_scan_seq = latest_scan_id  # Use same ID for seq
+                        latest_scan_ts = time.time()
                         camera_error = None  # Clear any previous error
+                        scan_condition.notify_all()
 
                     print(f"[DECODE] Scan #{latest_scan_id}: {code}")
 
@@ -329,7 +356,7 @@ def barcode_decode_loop():
 def debug_frame():
     """Debug endpoint to capture and save current frame"""
     try:
-        with frame_lock:
+        with frame_condition:
             if latest_frame is None:
                 return jsonify({"error": "No frame available"}), 404
 
@@ -404,37 +431,41 @@ def video_stream():
     """
     MJPEG video stream endpoint for displaying camera feed.
     Only intended for debug/dev use - not for production.
+    
+    Uses lores stream frames (no capture calls, just reads from shared state).
     """
     def generate():
         """Generator function to stream MJPEG frames"""
+        last_seen_seq = 0
         while running:
             try:
-                with frame_lock:
-                    if latest_frame is None:
-                        time.sleep(0.1)
-                        continue
-                    # Copy frame to avoid holding lock too long
-                    frame = latest_frame.copy()
+                # Wait for new lores frame
+                frame = None
+                with frame_condition:
+                    # Wait until latest_lores_seq advances or timeout
+                    frame_condition.wait(timeout=1.0)
+                    if latest_lores_frame is not None and latest_lores_seq > last_seen_seq:
+                        frame = latest_lores_frame.copy()
+                        last_seen_seq = latest_lores_seq
+                
+                if frame is None:
+                    continue
 
-                # Convert RGB to BGR for OpenCV encoding
+                # Convert RGB to BGR for OpenCV encoding (lores is already RGB888)
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-                # Resize for lower bandwidth (optional - adjust as needed)
-                # Keep original size for better quality in debug
-                # bgr = cv2.resize(bgr, (640, 360))
-
-                # Encode as JPEG
-                ret, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                # Encode as JPEG with preview quality
+                ret, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
                 if not ret:
-                    time.sleep(0.033)  # ~30 FPS
+                    time.sleep(1.0 / PREVIEW_FPS)
                     continue
 
                 # Yield MJPEG frame
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
 
-                # Small delay to control frame rate (~15 FPS for video stream)
-                time.sleep(0.067)
+                # Throttle to PREVIEW_FPS
+                time.sleep(1.0 / PREVIEW_FPS)
             except Exception as e:
                 print(f"[VIDEO] Error in video stream: {e}")
                 time.sleep(0.1)
@@ -521,107 +552,93 @@ def next_scan():
     Long-polling endpoint to get the next barcode scan.
 
     Query parameters:
-        since_id (int, optional): The last scan ID the client has seen.
-                                  Only return scans with id > since_id.
+        since (int, optional): The last scan sequence number the client has seen.
+                               Only return scans with seq > since. Default: 0
+        timeout (float, optional): Maximum time to wait for a new scan in seconds.
+                                   Default: 15
 
     Returns immediately if a new scan is available, otherwise waits up to
-    NEXT_SCAN_TIMEOUT seconds for a new scan.
+    timeout seconds for a new scan using efficient Condition.wait().
 
-    Response formats:
-        Success with new scan:
+    Response format:
         {
-            "success": true,
-            "id": 123,
-            "code": "1234567890",
-            "timestamp": "2025-01-01T00:00:00Z"
-        }
-
-        Timeout (no new scan):
-        {
-            "success": false,
-            "id": since_id,
-            "code": null,
-            "timeout": true
-        }
-
-        Error:
-        {
-            "success": false,
-            "code": null,
-            "error": "Could not read from camera"
+            "ok": true,
+            "scan": {
+                "id": 123,
+                "code": "1234567890",
+                "timestamp": "2025-01-01T00:00:00Z"
+            } or null,
+            "seq": 123
         }
     """
     if request.method == 'OPTIONS':
         return '', 200
     try:
-        # Parse since_id parameter
-        since_id = 0
-        if 'since_id' in request.args:
+        # Parse query parameters
+        since = 0
+        if 'since' in request.args:
             try:
-                since_id = int(request.args.get('since_id', 0))
+                since = int(request.args.get('since', 0))
             except ValueError:
-                since_id = 0
+                since = 0
 
-        print(f"[HTTP] GET /next_scan?since_id={since_id}")
+        timeout = 15.0
+        if 'timeout' in request.args:
+            try:
+                timeout = float(request.args.get('timeout', 15.0))
+            except ValueError:
+                timeout = 15.0
 
-        # Check if there's already a new scan available
+        print(f"[HTTP] GET /next_scan?since={since}&timeout={timeout}")
+
+        # Check for errors first
         with scan_lock:
             if camera_error:
                 return jsonify({
-                    "success": False,
-                    "code": None,
+                    "ok": False,
+                    "scan": None,
                     "error": camera_error
                 }), 500
 
-            if latest_scan is not None and latest_scan["id"] > since_id:
-                # Return immediately
-                print(f"[HTTP] /next_scan returning scan #{latest_scan['id']}: {latest_scan['code']}")
+        # Use Condition.wait() for efficient long-polling (no busy polling)
+        with scan_condition:
+            # Check if there's already a new scan available
+            if latest_scan_seq > since:
+                scan_data = latest_scan if latest_scan else None
+                print(f"[HTTP] /next_scan returning scan immediately (seq={latest_scan_seq})")
                 return jsonify({
-                    "success": True,
-                    **latest_scan
+                    "ok": True,
+                    "scan": scan_data,
+                    "seq": latest_scan_seq
                 })
 
-        # No new scan available, wait for one (long-polling)
-        print(f"[HTTP] /next_scan no new scan, long-polling (timeout={NEXT_SCAN_TIMEOUT}s)")
-        deadline = time.time() + NEXT_SCAN_TIMEOUT
-        start_id = since_id
+            # Wait for new scan or timeout
+            print(f"[HTTP] /next_scan no new scan, waiting (since={since}, timeout={timeout}s)")
+            scan_condition.wait(timeout)
 
-        while time.time() < deadline:
-            time.sleep(0.1)  # Check every 100ms
-
-            with scan_lock:
-                # Check for errors
-                if camera_error:
-                    print(f"[HTTP] /next_scan error during poll: {camera_error}")
-                    return jsonify({
-                        "success": False,
-                        "code": None,
-                        "error": camera_error
-                    }), 500
-
-                # Check for new scan
-                if latest_scan is not None and latest_scan["id"] > since_id:
-                    print(f"[HTTP] /next_scan found new scan #{latest_scan['id']}: {latest_scan['code']}")
-                    return jsonify({
-                        "success": True,
-                        **latest_scan
-                    })
-
-        # Timeout - no new scan
-        with scan_lock:
-            current_id = latest_scan["id"] if latest_scan else start_id
-        print(f"[HTTP] /next_scan timeout, returning (current_id={current_id})")
-        return jsonify({
-            "success": False,
-            "id": current_id,
-            "code": None,
-            "timeout": True
-        })
+            # Check again after wait
+            if latest_scan_seq > since:
+                scan_data = latest_scan if latest_scan else None
+                print(f"[HTTP] /next_scan found new scan (seq={latest_scan_seq})")
+                return jsonify({
+                    "ok": True,
+                    "scan": scan_data,
+                    "seq": latest_scan_seq
+                })
+            else:
+                # Timeout - no new scan
+                print(f"[HTTP] /next_scan timeout, returning (seq={latest_scan_seq})")
+                return jsonify({
+                    "ok": True,
+                    "scan": None,
+                    "seq": latest_scan_seq
+                })
 
     except Exception as e:
+        print(f"[HTTP] /next_scan error: {e}")
         return jsonify({
-            "success": False,
-            "code": None,
+            "ok": False,
+            "scan": None,
             "error": f"Server error: {str(e)}"
         }), 500
 
