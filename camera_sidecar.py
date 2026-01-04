@@ -5,12 +5,10 @@ Camera Sidecar Service for Raspberry Pi Camera Barcode Scanning
 This service continuously captures frames from the Pi Camera using libcamera (Picamera2)
 and decodes barcodes, streaming new scans to clients via long-polling HTTP endpoints.
 
-Usage:
-    python3 sidecar/camera_sidecar.py
+Usage outside of the guestbook client:
+    python3 camera_sidecar.py
 
 The service will start on http://127.0.0.1:7313
-
-For systemd service, see sidecar/camera_sidecar.service.example
 """
 
 import time
