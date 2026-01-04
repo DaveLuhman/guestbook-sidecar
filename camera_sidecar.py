@@ -77,7 +77,7 @@ def camera_capture_loop():
     Continuously captures frames from the camera using Picamera2 (libcamera).
     Runs in a background thread.
     """
-    global latest_frame, camera_error, picam2
+    global latest_frame, latest_frame_seq, latest_lores_frame, latest_lores_seq, camera_error, picam2
 
     print("Starting camera capture loop...")
 
