@@ -50,9 +50,13 @@ MEMORY_MONITOR_INTERVAL = 500  # Log memory usage every N decode iterations (~10
 # Shared state
 picam2 = None
 latest_frame = None
+latest_lores_buffer = None  # Raw YUV420 buffer for preview
+PREVIEW_WIDTH = 640
+PREVIEW_HEIGHT = 360
 frame_lock = Lock()
 frame_condition = Condition(frame_lock)  # Condition for frame notification
 frame_sequence = 0  # Sequence counter for new frames
+lores_available = False  # Track if lores stream is available
 latest_scan_id = 0
 latest_scan = None
 scan_lock = Lock()
@@ -65,7 +69,7 @@ def camera_capture_loop():
     Continuously captures frames from the camera using Picamera2 (libcamera).
     Runs in a background thread.
     """
-    global latest_frame, camera_error, picam2, frame_sequence
+    global latest_frame, latest_lores_buffer, camera_error, picam2, frame_sequence, lores_available
 
     print("Starting camera capture loop...")
 
@@ -75,12 +79,25 @@ def camera_capture_loop():
 
         # Use multi-stream configuration:
         # - Main stream: high-res RGB for barcode detection
-        # - LoRes stream: lower-res for MJPEG preview (reduces CPU load)
-        config = pic.create_video_configuration(
-            main={"size": (1280, 720), "format": "RGB888"},
-            lores={"size": (640, 360), "format": "YUV420"}  # Lower res for preview
-        )
-        pic.configure(config)
+        # - LoRes stream: lower-res YUV420 for MJPEG preview (required format for Pi's libcamera pipeline)
+        lores_available = False
+        try:
+            config = pic.create_video_configuration(
+                main={"size": (1280, 720), "format": "RGB888"},
+                lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "YUV420"}  # YUV420 required for lores
+            )
+            pic.configure(config)
+            lores_available = True
+            print(f"[CAPTURE] Multi-stream configuration: main (1280x720 RGB) + lores ({PREVIEW_WIDTH}x{PREVIEW_HEIGHT} YUV420)")
+        except Exception as e:
+            # Fallback to single stream if multi-stream fails
+            print(f"[CAPTURE] Multi-stream config failed ({e}), using single stream")
+            config = pic.create_video_configuration(
+                main={"size": (1280, 720), "format": "RGB888"}
+            )
+            pic.configure(config)
+            lores_available = False
+            print("[CAPTURE] Single-stream configuration: main (1280x720 RGB)")
 
         # Enable autofocus
         autofocus_enabled = False
@@ -129,12 +146,24 @@ def camera_capture_loop():
         autofocus_trigger_interval = 150  # Trigger autofocus every ~10 seconds (150 frames at 14fps)
         while running:
             try:
-                frame = pic.capture_array()
+                # Capture both streams if lores is available
+                if lores_available:
+                    # Capture main stream for detection
+                    frame = pic.capture_array()
+                    # Capture lores buffer for preview (raw YUV420 bytes)
+                    lores_buf = pic.capture_buffer("lores")
+                else:
+                    # Single stream mode
+                    frame = pic.capture_array()
+                    lores_buf = None
+                
                 frame_count += 1
                 with frame_condition:
                     # Replace old frame reference (let GC clean it up)
                     old_frame = latest_frame
                     latest_frame = frame
+                    # Store lores buffer for preview
+                    latest_lores_buffer = lores_buf
                     frame_sequence += 1
                     # Explicitly delete old frame reference to help GC
                     del old_frame
@@ -465,41 +494,43 @@ def video_stream():
                     time.sleep(0.01)  # Small sleep to avoid busy-waiting
                     continue
 
-                # Use lores stream if available (separate from detection stream)
+                # Use stored lores buffer if available (no camera capture in preview thread)
                 preview_frame = None
-                if picam2 is not None:
-                    try:
-                        # Capture from lores stream (lower resolution, less CPU)
-                        preview_frame = picam2.capture_array("lores")
-                        # Handle YUV420 format from lores stream
-                        if preview_frame.ndim == 2:  # Y plane only (grayscale)
-                            preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_GRAY2BGR)
-                        elif preview_frame.ndim == 3 and preview_frame.shape[2] == 3:
-                            # Already RGB/BGR format
-                            preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_RGB2BGR)
-                        else:
-                            # Try YUV420 conversion (Picamera2 may return planar YUV)
+                with frame_lock:
+                    if lores_available and latest_lores_buffer is not None:
+                        try:
+                            # Convert YUV420 buffer to BGR
+                            # YUV420 (I420) format: Y plane (h*w) + U plane (h*w/4) + V plane (h*w/4)
+                            w, h = PREVIEW_WIDTH, PREVIEW_HEIGHT
+                            yuv = np.frombuffer(latest_lores_buffer, dtype=np.uint8).reshape((h * 3 // 2, w))
+                            
+                            # Convert YUV420 (I420) to BGR - try I420 first (most common)
                             try:
-                                preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_YUV420p2BGR)
+                                bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
                             except:
-                                # If conversion fails, treat as grayscale
-                                if preview_frame.ndim == 2:
-                                    preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_GRAY2BGR)
-                    except Exception as e:
-                        # Fallback to main stream if lores not available
-                        print(f"[VIDEO] Could not use lores stream, falling back: {e}")
-                        with frame_lock:
+                                # If I420 fails, try NV12 (some pipelines use this)
+                                bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+                            
+                            preview_frame = bgr
+                        except Exception as e:
+                            # Fallback to main stream if lores conversion fails
                             if latest_frame is not None:
                                 preview_frame = latest_frame.copy()
                                 # Convert RGB to BGR for OpenCV encoding
                                 preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_RGB2BGR)
+                                # Downscale main stream for preview
+                                preview_frame = cv2.resize(preview_frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
+                    elif latest_frame is not None:
+                        # Single stream mode: use main stream with downscaling
+                        preview_frame = latest_frame.copy()
+                        # Convert RGB to BGR for OpenCV encoding
+                        preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_RGB2BGR)
+                        # Downscale for preview
+                        preview_frame = cv2.resize(preview_frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
 
                 if preview_frame is None:
                     time.sleep(0.1)
                     continue
-
-                # Downscale for lower bandwidth and CPU usage
-                preview_frame = cv2.resize(preview_frame, (640, 360))
 
                 # Encode as JPEG with lower quality for faster encoding
                 ret, jpeg = cv2.imencode('.jpg', preview_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
