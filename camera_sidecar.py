@@ -431,7 +431,7 @@ def video_stream():
     """
     MJPEG video stream endpoint for displaying camera feed.
     Only intended for debug/dev use - not for production.
-    
+
     Uses lores stream frames (no capture calls, just reads from shared state).
     """
     def generate():
@@ -447,7 +447,7 @@ def video_stream():
                     if latest_lores_frame is not None and latest_lores_seq > last_seen_seq:
                         frame = latest_lores_frame.copy()
                         last_seen_seq = latest_lores_seq
-                
+
                 if frame is None:
                     continue
 
@@ -574,11 +574,17 @@ def next_scan():
     if request.method == 'OPTIONS':
         return '', 200
     try:
-        # Parse query parameters
+        # Parse query parameters - support both old API (since_id) and new API (since)
         since = 0
         if 'since' in request.args:
             try:
                 since = int(request.args.get('since', 0))
+            except ValueError:
+                since = 0
+        elif 'since_id' in request.args:
+            # Backward compatibility with old API
+            try:
+                since = int(request.args.get('since_id', 0))
             except ValueError:
                 since = 0
 
@@ -589,16 +595,28 @@ def next_scan():
             except ValueError:
                 timeout = 15.0
 
-        print(f"[HTTP] GET /next_scan?since={since}&timeout={timeout}")
+        # Log which API format was used
+        using_old_api = 'since_id' in request.args
+        api_format = 'since_id' if using_old_api else 'since'
+        print(f"[HTTP] GET /next_scan?{api_format}={since}&timeout={timeout}")
 
         # Check for errors first
         with scan_lock:
             if camera_error:
-                return jsonify({
-                    "ok": False,
-                    "scan": None,
-                    "error": camera_error
-                }), 500
+                if using_old_api:
+                    # Old API error format
+                    return jsonify({
+                        "success": False,
+                        "code": None,
+                        "error": camera_error
+                    }), 500
+                else:
+                    # New API error format
+                    return jsonify({
+                        "ok": False,
+                        "scan": None,
+                        "error": camera_error
+                    }), 500
 
         # Use Condition.wait() for efficient long-polling (no busy polling)
         with scan_condition:
@@ -606,11 +624,27 @@ def next_scan():
             if latest_scan_seq > since:
                 scan_data = latest_scan if latest_scan else None
                 print(f"[HTTP] /next_scan returning scan immediately (seq={latest_scan_seq})")
-                return jsonify({
-                    "ok": True,
-                    "scan": scan_data,
-                    "seq": latest_scan_seq
-                })
+                if using_old_api:
+                    # Old API response format
+                    if scan_data:
+                        return jsonify({
+                            "success": True,
+                            **scan_data
+                        })
+                    else:
+                        return jsonify({
+                            "success": False,
+                            "id": since,
+                            "code": None,
+                            "timeout": True
+                        })
+                else:
+                    # New API response format
+                    return jsonify({
+                        "ok": True,
+                        "scan": scan_data,
+                        "seq": latest_scan_seq
+                    })
 
             # Wait for new scan or timeout
             print(f"[HTTP] /next_scan no new scan, waiting (since={since}, timeout={timeout}s)")
@@ -620,27 +654,63 @@ def next_scan():
             if latest_scan_seq > since:
                 scan_data = latest_scan if latest_scan else None
                 print(f"[HTTP] /next_scan found new scan (seq={latest_scan_seq})")
-                return jsonify({
-                    "ok": True,
-                    "scan": scan_data,
-                    "seq": latest_scan_seq
-                })
+                if using_old_api:
+                    # Old API response format
+                    if scan_data:
+                        return jsonify({
+                            "success": True,
+                            **scan_data
+                        })
+                    else:
+                        return jsonify({
+                            "success": False,
+                            "id": since,
+                            "code": None,
+                            "timeout": True
+                        })
+                else:
+                    # New API response format
+                    return jsonify({
+                        "ok": True,
+                        "scan": scan_data,
+                        "seq": latest_scan_seq
+                    })
             else:
                 # Timeout - no new scan
                 print(f"[HTTP] /next_scan timeout, returning (seq={latest_scan_seq})")
-                return jsonify({
-                    "ok": True,
-                    "scan": None,
-                    "seq": latest_scan_seq
-                })
+                if using_old_api:
+                    # Old API timeout format
+                    current_id = latest_scan["id"] if latest_scan else since
+                    return jsonify({
+                        "success": False,
+                        "id": current_id,
+                        "code": None,
+                        "timeout": True
+                    })
+                else:
+                    # New API timeout format
+                    return jsonify({
+                        "ok": True,
+                        "scan": None,
+                        "seq": latest_scan_seq
+                    })
 
     except Exception as e:
         print(f"[HTTP] /next_scan error: {e}")
-        return jsonify({
-            "ok": False,
-            "scan": None,
-            "error": f"Server error: {str(e)}"
-        }), 500
+        # Determine API format from request (default to new if can't determine)
+        using_old_api = 'since_id' in request.args if hasattr(request, 'args') else False
+        if using_old_api:
+            return jsonify({
+                "success": False,
+                "code": None,
+                "error": f"Server error: {str(e)}"
+            }), 500
+        else:
+            return jsonify({
+                "ok": False,
+                "scan": None,
+                "error": f"Server error: {str(e)}"
+            }), 500
 
 
 def start_threads():
