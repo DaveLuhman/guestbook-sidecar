@@ -202,7 +202,7 @@ def barcode_decode_loop():
     Continuously decodes barcodes from captured frames.
     Runs in a background thread separate from capture.
     """
-    global latest_scan_id, latest_scan, camera_error
+    global latest_scan_id, latest_scan, latest_scan_seq, latest_scan_ts, camera_error
 
     print("Starting barcode decode loop...")
 
