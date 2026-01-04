@@ -87,10 +87,11 @@ def camera_capture_loop():
 
         # Use multi-stream configuration:
         # - main: RGB888 at 1280x720 for barcode detection
-        # - lores: RGB888 at 640x360 for preview (no YUV color shift)
+        # - lores: YUV420 at 640x360 for preview (hardware requirement: lores must be YUV)
+        # Note: YUV420 is planar format, we'll convert it properly in the video endpoint
         config = pic.create_video_configuration(
             main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"},
-            lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"}
+            lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "YUV420"}
         )
         pic.configure(config)
 
@@ -125,7 +126,7 @@ def camera_capture_loop():
             except Exception as e:
                 print(f"[CAPTURE] Warning: Could not trigger initial autofocus: {e}")
 
-        print(f"Camera opened successfully (main: {CAMERA_WIDTH}x{CAMERA_HEIGHT} RGB, lores: {PREVIEW_WIDTH}x{PREVIEW_HEIGHT} RGB)")
+        print(f"Camera opened successfully (main: {CAMERA_WIDTH}x{CAMERA_HEIGHT} RGB, lores: {PREVIEW_WIDTH}x{PREVIEW_HEIGHT} YUV)")
 
         # Capture a test frame to verify camera is working
         try:
@@ -437,7 +438,6 @@ def video_stream():
     def generate():
         """Generator function to stream MJPEG frames"""
         last_seen_seq = 0
-        last_seen_seq = 0
         while running:
             try:
                 # Wait for new lores frame
@@ -452,8 +452,21 @@ def video_stream():
                 if frame is None:
                     continue
 
-                # Convert RGB to BGR for OpenCV encoding (lores is already RGB888)
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # Convert YUV420 to BGR for OpenCV encoding
+                # Picamera2 returns YUV420 in planar format: shape is (height*3/2, width)
+                # Use cv2.cvtColor with COLOR_YUV2BGR_I420 which handles planar YUV420
+                height, width = PREVIEW_HEIGHT, PREVIEW_WIDTH
+                if len(frame.shape) == 2 and frame.shape[0] == height * 3 // 2:
+                    # Planar YUV420 format - convert directly
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                else:
+                    # Fallback: try to reshape and convert
+                    # If frame is already in a different format, attempt conversion
+                    try:
+                        bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                    except:
+                        # Last resort: assume it's interleaved YUV and convert
+                        bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR)
 
                 # Encode as JPEG with preview quality
                 ret, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
