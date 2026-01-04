@@ -5,25 +5,25 @@ Camera Sidecar Service for Raspberry Pi Camera Barcode Scanning
 This service continuously captures frames from the Pi Camera using libcamera (Picamera2)
 and decodes barcodes, streaming new scans to clients via long-polling HTTP endpoints.
 
-Usage outside of the guestbook client:
-    python3 camera_sidecar.py
+Usage:
+    python3 sidecar/camera_sidecar.py
 
 The service will start on http://127.0.0.1:7313
+
+For systemd service, see sidecar/camera_sidecar.service.example
 """
 
 import time
 import threading
 import gc
 import sys
-import os
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request, Response
-from threading import Thread, Lock, Condition
+from threading import Thread, Lock
 from picamera2 import Picamera2
 import cv2
 import numpy as np
 from pyzbar.pyzbar import decode as decode_barcodes, ZBarSymbol
-import psutil
 
 app = Flask(__name__)
 
@@ -44,22 +44,30 @@ CAPTURE_FPS = 14  # Target capture rate (~14 FPS)
 CAPTURE_INTERVAL = 1.0 / CAPTURE_FPS  # ~0.07 seconds between captures
 DECODE_INTERVAL = 0.02  # Reduced delay to process frames faster (~50 FPS decode rate)
 DECODE_SKIP_FRAMES = 2  # Only decode every Nth frame to keep up with capture rate
-GC_COLLECT_INTERVAL = 2000  # Force garbage collection every N decode iterations (~40 seconds, reduced frequency)
+GC_COLLECT_INTERVAL = 1000  # Force garbage collection every N decode iterations (~20 seconds)
 MEMORY_MONITOR_INTERVAL = 500  # Log memory usage every N decode iterations (~10 seconds)
+
+# Camera resolution constants
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+PREVIEW_WIDTH = 640
+PREVIEW_HEIGHT = 360
+PREVIEW_FPS = 15
+PREVIEW_JPEG_QUALITY = 85
 
 # Shared state
 picam2 = None
 latest_frame = None
-latest_lores_buffer = None  # Raw YUV420 buffer for preview
-PREVIEW_WIDTH = 640
-PREVIEW_HEIGHT = 360
-frame_lock = Lock()
-frame_condition = Condition(frame_lock)  # Condition for frame notification
-frame_sequence = 0  # Sequence counter for new frames
-lores_available = False  # Track if lores stream is available
+latest_frame_seq = 0
+latest_lores_frame = None
+latest_lores_seq = 0
+frame_condition = threading.Condition()
 latest_scan_id = 0
 latest_scan = None
-scan_lock = Lock()
+latest_scan_ts = None
+latest_scan_seq = 0
+scan_condition = threading.Condition()
+scan_lock = Lock()  # Keep for backward compatibility with error handling
 camera_error = None
 running = True
 
@@ -69,7 +77,7 @@ def camera_capture_loop():
     Continuously captures frames from the camera using Picamera2 (libcamera).
     Runs in a background thread.
     """
-    global latest_frame, latest_lores_buffer, camera_error, picam2, frame_sequence, lores_available
+    global latest_frame, camera_error, picam2
 
     print("Starting camera capture loop...")
 
@@ -78,26 +86,13 @@ def camera_capture_loop():
         picam2 = pic
 
         # Use multi-stream configuration:
-        # - Main stream: high-res RGB for barcode detection
-        # - LoRes stream: lower-res YUV420 for MJPEG preview (required format for Pi's libcamera pipeline)
-        lores_available = False
-        try:
-            config = pic.create_video_configuration(
-                main={"size": (1280, 720), "format": "RGB888"},
-                lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "YUV420"}  # YUV420 required for lores
-            )
-            pic.configure(config)
-            lores_available = True
-            print(f"[CAPTURE] Multi-stream configuration: main (1280x720 RGB) + lores ({PREVIEW_WIDTH}x{PREVIEW_HEIGHT} YUV420)")
-        except Exception as e:
-            # Fallback to single stream if multi-stream fails
-            print(f"[CAPTURE] Multi-stream config failed ({e}), using single stream")
-            config = pic.create_video_configuration(
-                main={"size": (1280, 720), "format": "RGB888"}
-            )
-            pic.configure(config)
-            lores_available = False
-            print("[CAPTURE] Single-stream configuration: main (1280x720 RGB)")
+        # - main: RGB888 at 1280x720 for barcode detection
+        # - lores: RGB888 at 640x360 for preview (no YUV color shift)
+        config = pic.create_video_configuration(
+            main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"},
+            lores={"size": (PREVIEW_WIDTH, PREVIEW_HEIGHT), "format": "RGB888"}
+        )
+        pic.configure(config)
 
         # Enable autofocus
         autofocus_enabled = False
@@ -130,11 +125,11 @@ def camera_capture_loop():
             except Exception as e:
                 print(f"[CAPTURE] Warning: Could not trigger initial autofocus: {e}")
 
-        print("Camera opened successfully (1280x720 RGB)")
+        print(f"Camera opened successfully (main: {CAMERA_WIDTH}x{CAMERA_HEIGHT} RGB, lores: {PREVIEW_WIDTH}x{PREVIEW_HEIGHT} RGB)")
 
         # Capture a test frame to verify camera is working
         try:
-            test_frame = pic.capture_array()
+            test_frame = pic.capture_array("main")
             print(f"[CAPTURE] Test frame captured: shape={test_frame.shape}, dtype={test_frame.dtype}")
             # Save test frame for debugging
             cv2.imwrite('/tmp/camera_test_frame.jpg', cv2.cvtColor(test_frame, cv2.COLOR_RGB2BGR))
@@ -146,28 +141,21 @@ def camera_capture_loop():
         autofocus_trigger_interval = 150  # Trigger autofocus every ~10 seconds (150 frames at 14fps)
         while running:
             try:
-                # Capture both streams if lores is available
-                if lores_available:
-                    # Capture main stream for detection
-                    frame = pic.capture_array()
-                    # Capture lores buffer for preview (raw YUV420 bytes)
-                    lores_buf = pic.capture_buffer("lores")
-                else:
-                    # Single stream mode
-                    frame = pic.capture_array()
-                    lores_buf = None
-                
+                # Capture both main and lores streams
+                main_frame = pic.capture_array("main")
+                lores_frame = pic.capture_array("lores")
                 frame_count += 1
                 with frame_condition:
-                    # Replace old frame reference (let GC clean it up)
+                    # Replace old frame references (let GC clean them up)
                     old_frame = latest_frame
-                    latest_frame = frame
-                    # Store lores buffer for preview
-                    latest_lores_buffer = lores_buf
-                    frame_sequence += 1
-                    # Explicitly delete old frame reference to help GC
+                    old_lores_frame = latest_lores_frame
+                    latest_frame = main_frame
+                    latest_frame_seq += 1
+                    latest_lores_frame = lores_frame
+                    latest_lores_seq += 1
+                    # Explicitly delete old frame references to help GC
                     del old_frame
-                    # Notify waiting decode thread of new frame
+                    del old_lores_frame
                     frame_condition.notify_all()
 
                 # Periodically trigger autofocus to keep it adjusting
@@ -222,65 +210,42 @@ def barcode_decode_loop():
 
     decode_count = 0
     frame_skip_counter = 0
-    last_frame_sequence = 0
-
     while running:
         try:
             frame = None
-            current_sequence = 0
-
-            # Wait for new frame using condition variable instead of polling
             with frame_condition:
-                # Wait for a new frame (with timeout to allow shutdown)
-                frame_condition.wait(timeout=0.1)
-
                 if latest_frame is not None:
-                    current_sequence = frame_sequence
-                    # Skip frames to keep up with capture rate
-                    if current_sequence != last_frame_sequence:
-                        frame_skip_counter += 1
-                        if frame_skip_counter >= DECODE_SKIP_FRAMES:
-                            frame_skip_counter = 0
-                            last_frame_sequence = current_sequence
-                            # Assign frame reference directly (no copy!)
-                            frame = latest_frame
-                        else:
-                            last_frame_sequence = current_sequence
+                    frame = latest_frame.copy()
 
             if frame is not None:
+                # Skip frames to keep up with capture rate
+                frame_skip_counter += 1
+                if frame_skip_counter < DECODE_SKIP_FRAMES:
+                    time.sleep(DECODE_INTERVAL)
+                    continue
+                frame_skip_counter = 0
+
                 decode_count += 1
+                # Picamera2 gives RGB, OpenCV/pyzbar likes BGR
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-                # Convert RGB → GRAY directly (eliminates RGB → BGR → GRAY double conversion)
-                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                # Preprocess image for better barcode detection
+                # Convert to grayscale (pyzbar works better on grayscale)
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-                # Lazy preprocessing: try grayscale first, only compute expensive transforms on failure
+                # Try preprocessing approaches in order of speed/effectiveness
+                # Start with fastest methods first, only try slower ones if needed
+                processed_images = [
+                    ("grayscale", gray),  # Fastest and most effective
+                    ("grayscale_threshold", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),  # Good for blurry images
+                    ("grayscale_contrast", cv2.convertScaleAbs(gray, alpha=1.5, beta=30)),  # Increase contrast
+                ]
+
                 barcodes = []
-
-                # Try grayscale first (fastest)
-                try:
-                    detected = decode_barcodes(gray, symbols=[
-                        ZBarSymbol.CODE128,
-                        ZBarSymbol.CODE39,
-                        ZBarSymbol.EAN13,
-                        ZBarSymbol.EAN8,
-                        ZBarSymbol.UPCA,
-                        ZBarSymbol.UPCE,
-                        ZBarSymbol.I25,
-                        ZBarSymbol.CODABAR,
-                    ])
-                    if detected:
-                        barcodes.extend(detected)
-                        if decode_count % 50 == 0:
-                            print(f"[DECODE] Found {len(detected)} barcode(s) using grayscale")
-                except Exception as e:
-                    if decode_count % 50 == 0:
-                        print(f"[DECODE] Error with grayscale: {e}")
-
-                # Only try threshold if grayscale failed (or every N frames for robustness)
-                if not barcodes and decode_count % 3 == 0:
+                for method_name, processed_img in processed_images:
                     try:
-                        thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-                        detected = decode_barcodes(thresholded, symbols=[
+                        # Try decoding with all barcode types enabled
+                        detected = decode_barcodes(processed_img, symbols=[
                             ZBarSymbol.CODE128,
                             ZBarSymbol.CODE39,
                             ZBarSymbol.EAN13,
@@ -293,32 +258,13 @@ def barcode_decode_loop():
                         if detected:
                             barcodes.extend(detected)
                             if decode_count % 50 == 0:
-                                print(f"[DECODE] Found {len(detected)} barcode(s) using threshold")
+                                print(f"[DECODE] Found {len(detected)} barcode(s) using {method_name}")
+                            # If we found barcodes, we can stop trying other methods
+                            break
                     except Exception as e:
                         if decode_count % 50 == 0:
-                            print(f"[DECODE] Error with threshold: {e}")
-
-                # Only try contrast enhancement as last resort
-                if not barcodes and decode_count % 5 == 0:
-                    try:
-                        contrast = cv2.convertScaleAbs(gray, alpha=1.5, beta=30)
-                        detected = decode_barcodes(contrast, symbols=[
-                            ZBarSymbol.CODE128,
-                            ZBarSymbol.CODE39,
-                            ZBarSymbol.EAN13,
-                            ZBarSymbol.EAN8,
-                            ZBarSymbol.UPCA,
-                            ZBarSymbol.UPCE,
-                            ZBarSymbol.I25,
-                            ZBarSymbol.CODABAR,
-                        ])
-                        if detected:
-                            barcodes.extend(detected)
-                            if decode_count % 50 == 0:
-                                print(f"[DECODE] Found {len(detected)} barcode(s) using contrast")
-                    except Exception as e:
-                        if decode_count % 50 == 0:
-                            print(f"[DECODE] Error with contrast: {e}")
+                            print(f"[DECODE] Error with {method_name}: {e}")
+                        continue
 
                 # Remove duplicates (same code detected multiple times)
                 seen_codes = set()
@@ -339,15 +285,20 @@ def barcode_decode_loop():
 
                 # Memory monitoring and garbage collection
                 if decode_count % MEMORY_MONITOR_INTERVAL == 0:
+                    import psutil
+                    import os
                     try:
                         process = psutil.Process(os.getpid())
                         mem_info = process.memory_info()
                         mem_mb = mem_info.rss / 1024 / 1024
                         print(f"[MEMORY] RSS: {mem_mb:.1f} MB")
+                    except ImportError:
+                        # psutil not available, skip monitoring
+                        pass
                     except Exception as e:
                         print(f"[MEMORY] Error monitoring memory: {e}")
 
-                # Periodic garbage collection to free up numpy arrays (reduced frequency)
+                # Periodic garbage collection to free up numpy arrays
                 if decode_count % GC_COLLECT_INTERVAL == 0:
                     collected = gc.collect()
                     if collected > 0:
@@ -374,14 +325,17 @@ def barcode_decode_loop():
                         continue
 
                     # New scan detected
-                    with scan_lock:
+                    with scan_condition:
                         latest_scan_id += 1
                         latest_scan = {
                             "id": latest_scan_id,
                             "code": code,
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         }
+                        latest_scan_seq = latest_scan_id  # Use same ID for seq
+                        latest_scan_ts = time.time()
                         camera_error = None  # Clear any previous error
+                        scan_condition.notify_all()
 
                     print(f"[DECODE] Scan #{latest_scan_id}: {code}")
 
@@ -389,7 +343,7 @@ def barcode_decode_loop():
                     last_time = now
                     break  # Only handle one per frame
 
-            # No sleep needed - condition variable handles waiting efficiently
+            time.sleep(DECODE_INTERVAL)  # Small delay to avoid pegging CPU
 
         except Exception as e:
             print(f"Error in barcode decode loop: {e}")
@@ -402,7 +356,7 @@ def barcode_decode_loop():
 def debug_frame():
     """Debug endpoint to capture and save current frame"""
     try:
-        with frame_lock:
+        with frame_condition:
             if latest_frame is None:
                 return jsonify({"error": "No frame available"}), 404
 
@@ -476,73 +430,42 @@ def debug_frame():
 def video_stream():
     """
     MJPEG video stream endpoint for displaying camera feed.
-    Uses separate lores stream to avoid impacting detection performance.
     Only intended for debug/dev use - not for production.
+
+    Uses lores stream frames (no capture calls, just reads from shared state).
     """
     def generate():
         """Generator function to stream MJPEG frames"""
-        last_frame_time = 0.0
-        preview_fps = 6.0  # Target ~6 FPS for preview (reduces CPU load)
-        preview_interval = 1.0 / preview_fps  # ~0.167 seconds
-
+        last_seen_seq = 0
         while running:
             try:
-                current_time = time.time()
+                # Wait for new lores frame
+                frame = None
+                with frame_condition:
+                    # Wait until latest_lores_seq advances or timeout
+                    frame_condition.wait(timeout=1.0)
+                    if latest_lores_frame is not None and latest_lores_seq > last_seen_seq:
+                        frame = latest_lores_frame.copy()
+                        last_seen_seq = latest_lores_seq
 
-                # Throttle preview to target FPS
-                if current_time - last_frame_time < preview_interval:
-                    time.sleep(0.01)  # Small sleep to avoid busy-waiting
+                if frame is None:
                     continue
 
-                # Use stored lores buffer if available (no camera capture in preview thread)
-                preview_frame = None
-                with frame_lock:
-                    if lores_available and latest_lores_buffer is not None:
-                        try:
-                            # Convert YUV420 buffer to BGR
-                            # YUV420 (I420) format: Y plane (h*w) + U plane (h*w/4) + V plane (h*w/4)
-                            w, h = PREVIEW_WIDTH, PREVIEW_HEIGHT
-                            yuv = np.frombuffer(latest_lores_buffer, dtype=np.uint8).reshape((h * 3 // 2, w))
-                            
-                            # Convert YUV420 (I420) to BGR - try I420 first (most common)
-                            try:
-                                bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-                            except:
-                                # If I420 fails, try NV12 (some pipelines use this)
-                                bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
-                            
-                            preview_frame = bgr
-                        except Exception as e:
-                            # Fallback to main stream if lores conversion fails
-                            if latest_frame is not None:
-                                preview_frame = latest_frame.copy()
-                                # Convert RGB to BGR for OpenCV encoding
-                                preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_RGB2BGR)
-                                # Downscale main stream for preview
-                                preview_frame = cv2.resize(preview_frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
-                    elif latest_frame is not None:
-                        # Single stream mode: use main stream with downscaling
-                        preview_frame = latest_frame.copy()
-                        # Convert RGB to BGR for OpenCV encoding
-                        preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_RGB2BGR)
-                        # Downscale for preview
-                        preview_frame = cv2.resize(preview_frame, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
+                # Convert RGB to BGR for OpenCV encoding (lores is already RGB888)
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-                if preview_frame is None:
-                    time.sleep(0.1)
-                    continue
-
-                # Encode as JPEG with lower quality for faster encoding
-                ret, jpeg = cv2.imencode('.jpg', preview_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                # Encode as JPEG with preview quality
+                ret, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
                 if not ret:
-                    time.sleep(preview_interval)
+                    time.sleep(1.0 / PREVIEW_FPS)
                     continue
 
                 # Yield MJPEG frame
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
 
-                last_frame_time = current_time
+                # Throttle to PREVIEW_FPS
+                time.sleep(1.0 / PREVIEW_FPS)
             except Exception as e:
                 print(f"[VIDEO] Error in video stream: {e}")
                 time.sleep(0.1)
@@ -593,6 +516,8 @@ def trigger_autofocus():
 def debug_memory():
     """Debug endpoint to check memory usage"""
     try:
+        import psutil
+        import os
         process = psutil.Process(os.getpid())
         mem_info = process.memory_info()
 
@@ -627,109 +552,165 @@ def next_scan():
     Long-polling endpoint to get the next barcode scan.
 
     Query parameters:
-        since_id (int, optional): The last scan ID the client has seen.
-                                  Only return scans with id > since_id.
+        since (int, optional): The last scan sequence number the client has seen.
+                               Only return scans with seq > since. Default: 0
+        timeout (float, optional): Maximum time to wait for a new scan in seconds.
+                                   Default: 15
 
     Returns immediately if a new scan is available, otherwise waits up to
-    NEXT_SCAN_TIMEOUT seconds for a new scan.
+    timeout seconds for a new scan using efficient Condition.wait().
 
-    Response formats:
-        Success with new scan:
+    Response format:
         {
-            "success": true,
-            "id": 123,
-            "code": "1234567890",
-            "timestamp": "2025-01-01T00:00:00Z"
-        }
-
-        Timeout (no new scan):
-        {
-            "success": false,
-            "id": since_id,
-            "code": null,
-            "timeout": true
-        }
-
-        Error:
-        {
-            "success": false,
-            "code": null,
-            "error": "Could not read from camera"
+            "ok": true,
+            "scan": {
+                "id": 123,
+                "code": "1234567890",
+                "timestamp": "2025-01-01T00:00:00Z"
+            } or null,
+            "seq": 123
         }
     """
     if request.method == 'OPTIONS':
         return '', 200
     try:
-        # Parse since_id parameter
-        since_id = 0
-        if 'since_id' in request.args:
+        # Parse query parameters - support both old API (since_id) and new API (since)
+        since = 0
+        if 'since' in request.args:
             try:
-                since_id = int(request.args.get('since_id', 0))
+                since = int(request.args.get('since', 0))
             except ValueError:
-                since_id = 0
+                since = 0
+        elif 'since_id' in request.args:
+            # Backward compatibility with old API
+            try:
+                since = int(request.args.get('since_id', 0))
+            except ValueError:
+                since = 0
 
-        print(f"[HTTP] GET /next_scan?since_id={since_id}")
+        timeout = 15.0
+        if 'timeout' in request.args:
+            try:
+                timeout = float(request.args.get('timeout', 15.0))
+            except ValueError:
+                timeout = 15.0
 
-        # Check if there's already a new scan available
+        # Log which API format was used
+        using_old_api = 'since_id' in request.args
+        api_format = 'since_id' if using_old_api else 'since'
+        print(f"[HTTP] GET /next_scan?{api_format}={since}&timeout={timeout}")
+
+        # Check for errors first
         with scan_lock:
             if camera_error:
-                return jsonify({
-                    "success": False,
-                    "code": None,
-                    "error": camera_error
-                }), 500
-
-            if latest_scan is not None and latest_scan["id"] > since_id:
-                # Return immediately
-                print(f"[HTTP] /next_scan returning scan #{latest_scan['id']}: {latest_scan['code']}")
-                return jsonify({
-                    "success": True,
-                    **latest_scan
-                })
-
-        # No new scan available, wait for one (long-polling)
-        print(f"[HTTP] /next_scan no new scan, long-polling (timeout={NEXT_SCAN_TIMEOUT}s)")
-        deadline = time.time() + NEXT_SCAN_TIMEOUT
-        start_id = since_id
-
-        while time.time() < deadline:
-            time.sleep(0.1)  # Check every 100ms
-
-            with scan_lock:
-                # Check for errors
-                if camera_error:
-                    print(f"[HTTP] /next_scan error during poll: {camera_error}")
+                if using_old_api:
+                    # Old API error format
                     return jsonify({
                         "success": False,
                         "code": None,
                         "error": camera_error
                     }), 500
-
-                # Check for new scan
-                if latest_scan is not None and latest_scan["id"] > since_id:
-                    print(f"[HTTP] /next_scan found new scan #{latest_scan['id']}: {latest_scan['code']}")
+                else:
+                    # New API error format
                     return jsonify({
-                        "success": True,
-                        **latest_scan
+                        "ok": False,
+                        "scan": None,
+                        "error": camera_error
+                    }), 500
+
+        # Use Condition.wait() for efficient long-polling (no busy polling)
+        with scan_condition:
+            # Check if there's already a new scan available
+            if latest_scan_seq > since:
+                scan_data = latest_scan if latest_scan else None
+                print(f"[HTTP] /next_scan returning scan immediately (seq={latest_scan_seq})")
+                if using_old_api:
+                    # Old API response format
+                    if scan_data:
+                        return jsonify({
+                            "success": True,
+                            **scan_data
+                        })
+                    else:
+                        return jsonify({
+                            "success": False,
+                            "id": since,
+                            "code": None,
+                            "timeout": True
+                        })
+                else:
+                    # New API response format
+                    return jsonify({
+                        "ok": True,
+                        "scan": scan_data,
+                        "seq": latest_scan_seq
                     })
 
-        # Timeout - no new scan
-        with scan_lock:
-            current_id = latest_scan["id"] if latest_scan else start_id
-        print(f"[HTTP] /next_scan timeout, returning (current_id={current_id})")
-        return jsonify({
-            "success": False,
-            "id": current_id,
-            "code": None,
-            "timeout": True
-        })
+            # Wait for new scan or timeout
+            print(f"[HTTP] /next_scan no new scan, waiting (since={since}, timeout={timeout}s)")
+            scan_condition.wait(timeout)
+
+            # Check again after wait
+            if latest_scan_seq > since:
+                scan_data = latest_scan if latest_scan else None
+                print(f"[HTTP] /next_scan found new scan (seq={latest_scan_seq})")
+                if using_old_api:
+                    # Old API response format
+                    if scan_data:
+                        return jsonify({
+                            "success": True,
+                            **scan_data
+                        })
+                    else:
+                        return jsonify({
+                            "success": False,
+                            "id": since,
+                            "code": None,
+                            "timeout": True
+                        })
+                else:
+                    # New API response format
+                    return jsonify({
+                        "ok": True,
+                        "scan": scan_data,
+                        "seq": latest_scan_seq
+                    })
+            else:
+                # Timeout - no new scan
+                print(f"[HTTP] /next_scan timeout, returning (seq={latest_scan_seq})")
+                if using_old_api:
+                    # Old API timeout format
+                    current_id = latest_scan["id"] if latest_scan else since
+                    return jsonify({
+                        "success": False,
+                        "id": current_id,
+                        "code": None,
+                        "timeout": True
+                    })
+                else:
+                    # New API timeout format
+                    return jsonify({
+                        "ok": True,
+                        "scan": None,
+                        "seq": latest_scan_seq
+                    })
 
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "code": None,
-            "error": f"Server error: {str(e)}"
-        }), 500
+        print(f"[HTTP] /next_scan error: {e}")
+        # Determine API format from request (default to new if can't determine)
+        using_old_api = 'since_id' in request.args if hasattr(request, 'args') else False
+        if using_old_api:
+            return jsonify({
+                "success": False,
+                "code": None,
+                "error": f"Server error: {str(e)}"
+            }), 500
+        else:
+            return jsonify({
+                "ok": False,
+                "scan": None,
+                "error": f"Server error: {str(e)}"
+            }), 500
 
 
 def start_threads():
